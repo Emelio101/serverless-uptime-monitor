@@ -1,0 +1,143 @@
+name: Uptime Monitor
+
+on:
+  # Run every 10 minutes
+  schedule:
+    - cron: "*/10 * * * *"
+  # Allow manual trigger
+  workflow_dispatch:
+  # Run on push (to test changes)
+  push:
+    branches: ["main", "master"]
+
+permissions:
+  issues: write # Needed to open/close outage tickets
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    name: Check Website Status
+    steps:
+      - name: 🔍 Check Website Status
+        id: check
+        continue-on-error: true
+        run: |
+          # ----------------------------------------------------------------
+          # ⚙️ CONFIGURATION: ENTER YOUR WEBSITE URL BELOW
+          # ----------------------------------------------------------------
+          TARGET_URL="https://example.com" 
+          # ----------------------------------------------------------------
+
+          echo "URL=$TARGET_URL" >> $GITHUB_ENV
+
+          echo "Checking status for: $TARGET_URL"
+
+          # 1. Content Check (Deep Inspection)
+          # Uses -L to follow redirects and saves content to file
+          curl -s -L --retry 3 --max-time 10 "$TARGET_URL" > response.html
+
+          # 2. Check for specific error text (Soft Failures like 502/503)
+          if grep -i -E -q "Bad Gateway|Service Unavailable|Internal Server Error" response.html; then
+            echo "CRITICAL: Error text found in page content."
+            exit 1
+          fi
+
+          # 3. Standard HTTP Status Check
+          # Fails on network errors or HTTP 400+ codes
+          curl -fs -L --retry 3 --max-time 10 "$TARGET_URL" > /dev/null
+
+      - name: 🧠 Logic & Notification
+        id: decision
+        uses: actions/github-script@v6
+        with:
+          script: |
+            // Get status from previous step
+            const isDown = '${{ steps.check.outcome }}' === 'failure';
+            const label = 'uptime-outage';
+
+            // Check for existing open tickets
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label
+            });
+            const existingTicket = issues.data[0];
+            let shouldAlert = false;
+
+            if (isDown) {
+              console.log("Status: DOWN 🔴");
+              
+              if (!existingTicket) {
+                // CASE 1: Fresh Outage
+                console.log("New outage detected. Alerting.");
+                shouldAlert = true;
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: '🛑 Ongoing Outage: Website Down',
+                  body: `The monitor detected downtime at ${new Date().toISOString()}.\n\nTarget: ${{ env.URL }}`,
+                  labels: [label]
+                });
+              } else {
+                // CASE 2: Ongoing Outage (Anti-Spam Logic)
+                const lastAlertTime = new Date(existingTicket.created_at).getTime();
+                const now = new Date().getTime();
+                const hoursSinceAlert = (now - lastAlertTime) / (1000 * 60 * 60);
+                
+                if (hoursSinceAlert > 8) {
+                  console.log("Outage > 8 hours. Sending reminder.");
+                  shouldAlert = true;
+                  // Reset timer by closing old ticket and opening new one
+                  await github.rest.issues.update({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: existingTicket.number,
+                    state: 'closed'
+                  });
+                  await github.rest.issues.create({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    title: '🛑 Ongoing Outage (Reminder)',
+                    body: `The site is still down. Previous alert was >8 hours ago.`,
+                    labels: [label]
+                  });
+                } else {
+                  console.log(`Alert sent ${hoursSinceAlert.toFixed(1)} hours ago. Skipping email.`);
+                }
+              }
+            } else {
+              console.log("Status: UP 🟢");
+              // CASE 3: Recovery
+              if (existingTicket) {
+                console.log("Site recovered! Closing ticket.");
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: existingTicket.number,
+                  state: 'closed'
+                });
+              }
+            }
+            return shouldAlert;
+
+      - name: 📧 Send Email Alert
+        if: steps.decision.outputs.result == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "🚨 ALERT: Website is DOWN"
+          body: |
+            The automated monitor detected a failure.
+
+            Target: ${{ env.URL }}
+            Time: ${{ steps.check.outputs.time }}
+
+            Check the GitHub Issues tab for details.
+          # Default: sends email to the same address used for login
+          to: ${{ secrets.MAIL_USERNAME }}
+          from: "Uptime Monitor"
